@@ -27,3 +27,5 @@ Variables de entorno necesarias (configuradas en Cloudflare, no en este repo): `
 ## Estado
 
 Conectado a Cloudflare Workers Builds; deploy automatico activo.
+
+Repositorio de GitHub conectado y build automatico habilitado.
