@@ -205,9 +205,8 @@ async function handleListServices(request, env, slug) {
 }
 
 async function handleCheckAvailability(request, env, slug) {
-  const url = new URL(request.url);
-  const date = url.searchParams.get("date");
-  const serviceId = url.searchParams.get("service_id");
+  const body = await request.json().catch(() => ({}));
+  const { date, service_id: serviceId } = body;
   if (!date || !serviceId) {
     return json({ error: "Faltan parámetros: date, service_id" }, 400);
   }
@@ -425,7 +424,7 @@ export default {
       }
 
       const checkAvailMatch = url.pathname.match(/^\/voice\/([^/]+)\/check-availability$/);
-      if (request.method === "GET" && checkAvailMatch) {
+      if (request.method === "POST" && checkAvailMatch) {
         return handleCheckAvailability(request, env, decodeURIComponent(checkAvailMatch[1]));
       }
 
