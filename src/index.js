@@ -175,6 +175,156 @@ async function handleAdsPauseAll(request, env, clientId) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Endpoints de voz (Sofía / Retell) — multi-tenant, uno solo para todos los negocios.
+// El tenant se identifica por su "slug" en la URL: /voice/:slug/...
+// ---------------------------------------------------------------------------
+
+async function getTenantBySlug(env, slug) {
+  const rows = await sb(env, `tenants?slug=eq.${encodeURIComponent(slug)}&select=*`);
+  return rows[0] || null;
+}
+
+async function handleListServices(request, env, slug) {
+  const tenant = await getTenantBySlug(env, slug);
+  if (!tenant) return json({ error: "Negocio no encontrado" }, 404);
+  if (tenant.subscription_status !== "active") return json({ error: "Servicio no disponible" }, 403);
+
+  const services = await sb(
+    env,
+    `services?tenant_id=eq.${tenant.id}&active=eq.true&select=id,name,duration_minutes,price_cents&order=name.asc`
+  );
+  return json(
+    services.map((s) => ({
+      id: s.id,
+      name: s.name,
+      duration_minutes: s.duration_minutes,
+      price_eur: s.price_cents / 100,
+    }))
+  );
+}
+
+async function handleCheckAvailability(request, env, slug) {
+  const url = new URL(request.url);
+  const date = url.searchParams.get("date");
+  const serviceId = url.searchParams.get("service_id");
+  if (!date || !serviceId) {
+    return json({ error: "Faltan parámetros: date, service_id" }, 400);
+  }
+
+  const tenant = await getTenantBySlug(env, slug);
+  if (!tenant) return json({ error: "Negocio no encontrado" }, 404);
+  if (tenant.subscription_status !== "active") return json({ error: "Servicio no disponible" }, 403);
+
+  const serviceRows = await sb(env, `services?id=eq.${serviceId}&tenant_id=eq.${tenant.id}&select=duration_minutes`);
+  const service = serviceRows[0];
+  if (!service) return json({ error: "Servicio no encontrado" }, 404);
+  const durationMin = service.duration_minutes;
+
+  const weekday = new Date(`${date}T00:00:00Z`).getUTCDay(); // 0=domingo .. 6=sábado
+  const rules = await sb(
+    env,
+    `availability_rules?tenant_id=eq.${tenant.id}&weekday=eq.${weekday}&select=staff_id,start_time,end_time`
+  );
+  if (rules.length === 0) return json({ date, service_id: serviceId, slots: [] });
+
+  const staffIds = [...new Set(rules.map((r) => r.staff_id))];
+  const staffRows = await sb(
+    env,
+    `staff?tenant_id=eq.${tenant.id}&active=eq.true&id=in.(${staffIds.join(",")})&select=id,name`
+  );
+  const activeStaffById = new Map(staffRows.map((s) => [s.id, s]));
+
+  const existingAppts = await sb(
+    env,
+    `appointments?tenant_id=eq.${tenant.id}&starts_at=gte.${date}T00:00:00&starts_at=lte.${date}T23:59:59&status=neq.cancelled&select=staff_id,starts_at,ends_at`
+  );
+
+  const slots = [];
+  for (const rule of rules) {
+    const staffInfo = activeStaffById.get(rule.staff_id);
+    if (!staffInfo) continue;
+
+    let cursor = new Date(`${date}T${rule.start_time}Z`);
+    const end = new Date(`${date}T${rule.end_time}Z`);
+
+    while (cursor.getTime() + durationMin * 60000 <= end.getTime()) {
+      const slotEnd = new Date(cursor.getTime() + durationMin * 60000);
+      const overlaps = existingAppts.some(
+        (a) =>
+          a.staff_id === rule.staff_id &&
+          new Date(a.starts_at) < slotEnd &&
+          new Date(a.ends_at) > cursor
+      );
+      if (!overlaps) {
+        slots.push({
+          staff_id: rule.staff_id,
+          staff_name: staffInfo.name,
+          starts_at: cursor.toISOString(),
+          ends_at: slotEnd.toISOString(),
+        });
+      }
+      cursor = new Date(cursor.getTime() + durationMin * 60000);
+    }
+  }
+  slots.sort((a, b) => new Date(a.starts_at) - new Date(b.starts_at));
+
+  return json({ date, service_id: serviceId, slots });
+}
+
+async function handleCreateAppointment(request, env, slug) {
+  const body = await request.json();
+  const { customer_name, customer_phone, service_id, staff_id, starts_at } = body;
+  if (!customer_name || !customer_phone || !service_id || !staff_id || !starts_at) {
+    return json(
+      { error: "Faltan campos obligatorios: customer_name, customer_phone, service_id, staff_id, starts_at" },
+      400
+    );
+  }
+
+  const tenant = await getTenantBySlug(env, slug);
+  if (!tenant) return json({ error: "Negocio no encontrado" }, 404);
+  if (tenant.subscription_status !== "active") return json({ error: "Servicio no disponible" }, 403);
+
+  const serviceRows = await sb(env, `services?id=eq.${service_id}&tenant_id=eq.${tenant.id}&select=duration_minutes`);
+  const service = serviceRows[0];
+  if (!service) return json({ error: "Servicio no encontrado" }, 404);
+
+  const startsAtDate = new Date(starts_at);
+  const endsAtDate = new Date(startsAtDate.getTime() + service.duration_minutes * 60000);
+
+  const existingCustomers = await sb(
+    env,
+    `customers?tenant_id=eq.${tenant.id}&phone=eq.${encodeURIComponent(customer_phone)}&select=id`
+  );
+  let customerId = existingCustomers[0]?.id;
+  if (!customerId) {
+    const [newCustomer] = await sb(env, "customers", {
+      method: "POST",
+      prefer: "return=representation",
+      body: { tenant_id: tenant.id, name: customer_name, phone: customer_phone },
+    });
+    customerId = newCustomer.id;
+  }
+
+  const [appointment] = await sb(env, "appointments", {
+    method: "POST",
+    prefer: "return=representation",
+    body: {
+      tenant_id: tenant.id,
+      customer_id: customerId,
+      service_id,
+      staff_id,
+      starts_at: startsAtDate.toISOString(),
+      ends_at: endsAtDate.toISOString(),
+      status: "confirmed",
+      source: "voice",
+    },
+  });
+
+  return json(appointment);
+}
+
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, PATCH, DELETE, OPTIONS",
@@ -266,6 +416,22 @@ export default {
       const adsPauseMatch = url.pathname.match(/^\/clients\/([^/]+)\/ads-pause-all$/);
       if (request.method === "POST" && adsPauseMatch) {
         return handleAdsPauseAll(request, env, decodeURIComponent(adsPauseMatch[1]));
+      }
+
+      // --- Endpoints de voz (Sofía / Retell), multi-tenant ---
+      const listServicesMatch = url.pathname.match(/^\/voice\/([^/]+)\/list-services$/);
+      if (request.method === "GET" && listServicesMatch) {
+        return handleListServices(request, env, decodeURIComponent(listServicesMatch[1]));
+      }
+
+      const checkAvailMatch = url.pathname.match(/^\/voice\/([^/]+)\/check-availability$/);
+      if (request.method === "GET" && checkAvailMatch) {
+        return handleCheckAvailability(request, env, decodeURIComponent(checkAvailMatch[1]));
+      }
+
+      const createApptMatch = url.pathname.match(/^\/voice\/([^/]+)\/create-appointment$/);
+      if (request.method === "POST" && createApptMatch) {
+        return handleCreateAppointment(request, env, decodeURIComponent(createApptMatch[1]));
       }
 
       return json({ error: "Ruta no encontrada" }, 404);
