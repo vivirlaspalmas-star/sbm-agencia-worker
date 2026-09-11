@@ -478,6 +478,55 @@ async function handleDashboardCustomers(request, env, tenantId) {
   return json(rows);
 }
 
+async function handleDashboardTenantInfo(request, env, tenantId) {
+  const rows = await sb(env, `tenants?id=eq.${tenantId}&select=name,address,phone,logo_url`);
+  const tenant = rows[0];
+  if (!tenant) return json({ error: "Negocio no encontrado" }, 404);
+  return json(tenant);
+}
+
+async function handleDashboardLogoUpload(request, env, tenantId) {
+  const body = await request.json().catch(() => ({}));
+  const { data_base64, content_type } = body;
+  if (!data_base64 || !content_type) {
+    return json({ error: "Faltan data_base64 y content_type" }, 400);
+  }
+  if (!content_type.startsWith("image/")) {
+    return json({ error: "El archivo debe ser una imagen" }, 400);
+  }
+  // Límite generoso pero razonable para un logo (~5 MB en base64)
+  if (data_base64.length > 7_000_000) {
+    return json({ error: "La imagen es demasiado grande (máximo ~5 MB)" }, 400);
+  }
+
+  const bytes = Uint8Array.from(atob(data_base64), (c) => c.charCodeAt(0));
+  const ext = content_type.split("/")[1]?.replace("jpeg", "jpg") || "png";
+  const path = `${tenantId}/logo.${ext}`;
+
+  const uploadRes = await fetch(`${env.SUPABASE_URL}/storage/v1/object/tenant-logos/${path}`, {
+    method: "POST",
+    headers: {
+      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+      "Content-Type": content_type,
+      "x-upsert": "true",
+    },
+    body: bytes,
+  });
+  if (!uploadRes.ok) {
+    const errText = await uploadRes.text();
+    return json({ error: `No se pudo subir la imagen: ${errText}` }, 502);
+  }
+
+  const publicUrl = `${env.SUPABASE_URL}/storage/v1/object/public/tenant-logos/${path}?v=${Date.now()}`;
+  await sb(env, `tenants?id=eq.${tenantId}`, {
+    method: "PATCH",
+    body: { logo_url: publicUrl },
+  });
+
+  return json({ logo_url: publicUrl });
+}
+
 async function handleDashboardServices(request, env, tenantId) {
   const rows = await sb(env, `services?tenant_id=eq.${tenantId}&select=id,name,duration_minutes,price_cents,active&order=name.asc`);
   return json(rows);
@@ -736,6 +785,8 @@ export default {
 
       // --- Rutas del dashboard de cliente, todas requieren sesión válida ---
       const DASHBOARD_ROUTES = {
+        "GET /dashboard/tenant-info": handleDashboardTenantInfo,
+        "POST /dashboard/tenant-logo": handleDashboardLogoUpload,
         "GET /dashboard/leads": handleDashboardLeads,
         "GET /dashboard/appointments": handleDashboardAppointments,
         "GET /dashboard/customers": handleDashboardCustomers,
