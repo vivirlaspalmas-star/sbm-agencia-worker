@@ -324,10 +324,303 @@ async function handleCreateAppointment(request, env, slug) {
   return json(appointment);
 }
 
+// ---------------------------------------------------------------------------
+// Autenticación del dashboard de cliente — enlace mágico por email.
+// El tenant de cada petición se resuelve SIEMPRE a partir de la sesión válida,
+// nunca de un id en la URL, para que un cliente nunca pueda ver datos de otro.
+// ---------------------------------------------------------------------------
+
+const DASHBOARD_URL = "https://cuerpo-y-mente-dashboard.pages.dev"; // TODO: mover a un dominio propio del panel cuando se consolide
+const LOGIN_TOKEN_TTL_MS = 15 * 60 * 1000; // 15 minutos para canjear el enlace
+const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 días de sesión
+
+function randomToken() {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function sendMagicLinkEmail(env, email, token) {
+  const link = `${DASHBOARD_URL}/?token=${token}`;
+  const res = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${env.RESEND_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      from: "SBM AI Agency <panel@sbmaiagency.com>",
+      to: [email],
+      subject: "Tu enlace de acceso al panel",
+      html: `<p>Haz clic para entrar a tu panel de control:</p><p><a href="${link}">${link}</a></p><p>Este enlace caduca en 15 minutos y solo se puede usar una vez. Si no lo has pedido tú, ignora este correo.</p>`,
+    }),
+  });
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`Resend ${res.status}: ${errText}`);
+  }
+}
+
+async function handleRequestLogin(request, env) {
+  const body = await request.json().catch(() => ({}));
+  const email = (body.email || "").trim().toLowerCase();
+  if (!email) return json({ error: "Falta el email" }, 400);
+
+  // Respuesta siempre genérica, exista o no el email, para no filtrar qué correos están dados de alta
+  const generic = { sent: true, message: "Si ese email está registrado, te hemos enviado un enlace." };
+
+  const rows = await sb(env, `dashboard_users?email=eq.${encodeURIComponent(email)}&select=tenant_id`);
+  if (!rows.length) return json(generic);
+
+  const tenantId = rows[0].tenant_id;
+  const token = randomToken();
+  const expiresAt = new Date(Date.now() + LOGIN_TOKEN_TTL_MS).toISOString();
+
+  await sb(env, "dashboard_login_tokens", {
+    method: "POST",
+    body: { email, tenant_id: tenantId, token, expires_at: expiresAt },
+  });
+
+  try {
+    await sendMagicLinkEmail(env, email, token);
+  } catch (err) {
+    return json({ error: "No se pudo enviar el email. Inténtalo de nuevo en un momento." }, 502);
+  }
+
+  return json(generic);
+}
+
+async function handleVerifyLogin(request, env) {
+  const body = await request.json().catch(() => ({}));
+  const token = body.token || "";
+  if (!token) return json({ error: "Falta el token" }, 400);
+
+  const rows = await sb(env, `dashboard_login_tokens?token=eq.${encodeURIComponent(token)}&select=*`);
+  const loginToken = rows[0];
+  if (!loginToken) return json({ error: "Enlace no válido" }, 401);
+  if (loginToken.used_at) return json({ error: "Este enlace ya se ha usado" }, 401);
+  if (new Date(loginToken.expires_at) < new Date()) return json({ error: "Este enlace ha caducado" }, 401);
+
+  await sb(env, `dashboard_login_tokens?id=eq.${loginToken.id}`, {
+    method: "PATCH",
+    body: { used_at: new Date().toISOString() },
+  });
+
+  const sessionToken = randomToken();
+  const sessionExpiresAt = new Date(Date.now() + SESSION_TTL_MS).toISOString();
+  await sb(env, "dashboard_sessions", {
+    method: "POST",
+    body: {
+      token: sessionToken,
+      tenant_id: loginToken.tenant_id,
+      email: loginToken.email,
+      expires_at: sessionExpiresAt,
+    },
+  });
+
+  const tenantRows = await sb(env, `tenants?id=eq.${loginToken.tenant_id}&select=name`);
+  return json({
+    session_token: sessionToken,
+    tenant_id: loginToken.tenant_id,
+    tenant_name: tenantRows[0]?.name || "tu negocio",
+  });
+}
+
+// Devuelve { tenantId, email } si la sesión es válida, o null si no lo es.
+async function requireSession(request, env) {
+  const auth = request.headers.get("Authorization") || "";
+  const match = auth.match(/^Bearer (.+)$/);
+  if (!match) return null;
+  const sessionToken = match[1];
+
+  const rows = await sb(env, `dashboard_sessions?token=eq.${encodeURIComponent(sessionToken)}&select=tenant_id,email,expires_at`);
+  const session = rows[0];
+  if (!session) return null;
+  if (new Date(session.expires_at) < new Date()) return null;
+  return { tenantId: session.tenant_id, email: session.email };
+}
+
+// ---------------------------------------------------------------------------
+// Datos del dashboard de cliente — migrados desde el Worker por-cliente,
+// ahora siempre autenticados y con el tenant resuelto por sesión.
+// ---------------------------------------------------------------------------
+
+async function handleDashboardLeads(request, env, tenantId) {
+  const normalize = (s) => (s || "").replace(/\D/g, "").slice(-9);
+  const conversations = await sb(env, `conversations?tenant_id=eq.${tenantId}&select=id,channel,external_user_id,created_at&order=created_at.desc&limit=50`);
+  const customers = await sb(env, `customers?tenant_id=eq.${tenantId}&select=phone`);
+  const knownPhones = new Set(customers.map((c) => normalize(c.phone)).filter(Boolean));
+  const leadConvos = conversations.filter((c) => c.channel === "whatsapp" && !knownPhones.has(normalize(c.external_user_id)));
+  const leads = [];
+  for (const convo of leadConvos.slice(0, 15)) {
+    const lastMsg = await sb(env, `messages?conversation_id=eq.${convo.id}&role=eq.user&order=created_at.desc&limit=1&select=content,created_at`);
+    const preview = lastMsg[0]?.content?.slice(0, 80) || "(sin mensaje registrado)";
+    const when = lastMsg[0]?.created_at || convo.created_at;
+    const days = Math.max(0, Math.floor((Date.now() - new Date(when).getTime()) / 86400000));
+    leads.push({ name: "Cliente por WhatsApp", phone: convo.external_user_id, msg: preview, days, urgent: days >= 3 });
+  }
+  return json(leads);
+}
+
+async function handleDashboardAppointments(request, env, tenantId) {
+  const rows = await sb(
+    env,
+    `appointments?tenant_id=eq.${tenantId}&status=eq.confirmed&select=id,starts_at,ends_at,status,source,customers(name,phone),services(name,duration_minutes,price_cents)&order=starts_at.asc`
+  );
+  return json(rows);
+}
+
+async function handleDashboardCustomers(request, env, tenantId) {
+  const rows = await sb(
+    env,
+    `customers?tenant_id=eq.${tenantId}&archived=eq.false&select=id,name,phone,appointments(starts_at,services(name,price_cents,duration_minutes))`
+  );
+  return json(rows);
+}
+
+async function handleDashboardServices(request, env, tenantId) {
+  const rows = await sb(env, `services?tenant_id=eq.${tenantId}&select=id,name,duration_minutes,price_cents,active&order=name.asc`);
+  return json(rows);
+}
+
+async function handleDashboardAvailability(request, env, tenantId) {
+  const rows = await sb(env, `availability_rules?tenant_id=eq.${tenantId}&select=id,weekday,start_time,end_time,staff_id&order=weekday.asc,start_time.asc`);
+  return json(rows);
+}
+
+async function handleDashboardAppointmentCreate(request, env, tenantId) {
+  const body = await request.json();
+  let staffId = body.staff_id;
+  if (!staffId) {
+    const staffRows = await sb(env, `staff?tenant_id=eq.${tenantId}&select=id&limit=1`);
+    staffId = staffRows[0]?.id;
+  }
+  const result = await handleCreateAppointmentForTenant(env, tenantId, { ...body, staff_id: staffId }, "manual");
+  return json(result);
+}
+
+async function handleDashboardAppointmentCancel(request, env, tenantId) {
+  const body = await request.json();
+  if (!body.appointment_id) return json({ error: "Falta appointment_id" }, 400);
+  const existing = await sb(env, `appointments?id=eq.${body.appointment_id}&tenant_id=eq.${tenantId}&select=id`);
+  if (!existing.length) return json({ error: "Cita no encontrada para este negocio" }, 404);
+  const result = await sb(env, `appointments?id=eq.${body.appointment_id}`, {
+    method: "PATCH",
+    prefer: "return=representation",
+    body: { status: "cancelled" },
+  });
+  return json({ cancelled: true, appointment: result[0] || null });
+}
+
+async function handleDashboardServiceCreate(request, env, tenantId) {
+  const body = await request.json();
+  const row = await sb(env, "services", {
+    method: "POST",
+    prefer: "return=representation",
+    body: {
+      tenant_id: tenantId,
+      name: body.name || "Nuevo servicio",
+      duration_minutes: body.duration_minutes || 30,
+      price_cents: body.price_cents || 0,
+      active: true,
+    },
+  });
+  return json(row[0]);
+}
+
+async function handleDashboardServiceUpdate(request, env, tenantId) {
+  const body = await request.json();
+  if (!body.id) return json({ error: "Falta id" }, 400);
+  const patch = {};
+  for (const f of ["name", "duration_minutes", "price_cents", "active"]) {
+    if (body[f] !== undefined) patch[f] = body[f];
+  }
+  const result = await sb(env, `services?id=eq.${body.id}&tenant_id=eq.${tenantId}`, {
+    method: "PATCH",
+    prefer: "return=representation",
+    body: patch,
+  });
+  return json(result[0] || null);
+}
+
+async function handleDashboardAvailabilitySave(request, env, tenantId) {
+  const body = await request.json();
+  const staffRows = await sb(env, `staff?tenant_id=eq.${tenantId}&select=id&limit=1`);
+  const staffId = staffRows[0]?.id;
+  if (!staffId) return json({ error: "No hay ningún miembro del personal dado de alta para este negocio" }, 400);
+  await sb(env, `availability_rules?tenant_id=eq.${tenantId}`, { method: "DELETE" });
+  const newRows = (body.rules || []).map((r) => ({
+    tenant_id: tenantId,
+    staff_id: staffId,
+    weekday: r.weekday,
+    start_time: r.start_time,
+    end_time: r.end_time,
+  }));
+  const inserted = newRows.length
+    ? await sb(env, "availability_rules", { method: "POST", prefer: "return=representation", body: newRows })
+    : [];
+  return json({ saved: true, rules: inserted });
+}
+
+async function handleDashboardCustomerArchive(request, env, tenantId) {
+  const body = await request.json();
+  if (!body.customer_id) return json({ error: "Falta customer_id" }, 400);
+  const existing = await sb(env, `customers?id=eq.${body.customer_id}&tenant_id=eq.${tenantId}&select=id`);
+  if (!existing.length) return json({ error: "Clienta no encontrada para este negocio" }, 404);
+  const result = await sb(env, `customers?id=eq.${body.customer_id}`, {
+    method: "PATCH",
+    prefer: "return=representation",
+    body: { archived: true },
+  });
+  return json({ archived: true, customer: result[0] || null });
+}
+
+// Variante de create_appointment reutilizable tanto desde el dashboard como, en el futuro,
+// desde cualquier otro sitio que ya tenga el tenantId resuelto (en vez de un slug en la URL).
+async function handleCreateAppointmentForTenant(env, tenantId, input, source) {
+  const { customer_name, customer_phone, service_id, staff_id, starts_at } = input;
+  const serviceRows = await sb(env, `services?id=eq.${service_id}&tenant_id=eq.${tenantId}&select=duration_minutes`);
+  const service = serviceRows[0];
+  if (!service) return { error: "Servicio no encontrado" };
+  const startsAtDate = new Date(starts_at);
+  const endsAtDate = new Date(startsAtDate.getTime() + service.duration_minutes * 60000);
+
+  let customer = customer_phone
+    ? (await sb(env, `customers?tenant_id=eq.${tenantId}&phone=eq.${encodeURIComponent(customer_phone)}`))[0]
+    : null;
+  if (!customer) {
+    customer = (
+      await sb(env, "customers", {
+        method: "POST",
+        prefer: "return=representation",
+        body: { tenant_id: tenantId, name: customer_name, phone: customer_phone || null },
+      })
+    )[0];
+  }
+
+  const appointment = (
+    await sb(env, "appointments", {
+      method: "POST",
+      prefer: "return=representation",
+      body: {
+        tenant_id: tenantId,
+        customer_id: customer.id,
+        service_id,
+        staff_id,
+        starts_at: startsAtDate.toISOString(),
+        ends_at: endsAtDate.toISOString(),
+        status: "confirmed",
+        source: source || null,
+      },
+    })
+  )[0];
+  return { confirmed: true, appointment };
+}
+
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, PATCH, DELETE, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization",
 };
 
 function json(data, status = 200) {
@@ -431,6 +724,35 @@ export default {
       const createApptMatch = url.pathname.match(/^\/voice\/([^/]+)\/create-appointment$/);
       if (request.method === "POST" && createApptMatch) {
         return handleCreateAppointment(request, env, decodeURIComponent(createApptMatch[1]));
+      }
+
+      // --- Login del dashboard de cliente (enlace mágico) ---
+      if (request.method === "POST" && url.pathname === "/dashboard/request-login") {
+        return handleRequestLogin(request, env);
+      }
+      if (request.method === "POST" && url.pathname === "/dashboard/verify") {
+        return handleVerifyLogin(request, env);
+      }
+
+      // --- Rutas del dashboard de cliente, todas requieren sesión válida ---
+      const DASHBOARD_ROUTES = {
+        "GET /dashboard/leads": handleDashboardLeads,
+        "GET /dashboard/appointments": handleDashboardAppointments,
+        "GET /dashboard/customers": handleDashboardCustomers,
+        "GET /dashboard/services": handleDashboardServices,
+        "GET /dashboard/availability": handleDashboardAvailability,
+        "POST /dashboard/appointments/create": handleDashboardAppointmentCreate,
+        "POST /dashboard/appointments/cancel": handleDashboardAppointmentCancel,
+        "POST /dashboard/services/create": handleDashboardServiceCreate,
+        "POST /dashboard/services/update": handleDashboardServiceUpdate,
+        "POST /dashboard/availability/save": handleDashboardAvailabilitySave,
+        "POST /dashboard/customers/archive": handleDashboardCustomerArchive,
+      };
+      const routeKey = `${request.method} ${url.pathname}`;
+      if (DASHBOARD_ROUTES[routeKey]) {
+        const session = await requireSession(request, env);
+        if (!session) return json({ error: "Sesión no válida o caducada. Vuelve a iniciar sesión." }, 401);
+        return DASHBOARD_ROUTES[routeKey](request, env, session.tenantId);
       }
 
       return json({ error: "Ruta no encontrada" }, 404);
