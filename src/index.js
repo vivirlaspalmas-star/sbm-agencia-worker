@@ -180,6 +180,47 @@ async function handleAdsPauseAll(request, env, clientId) {
 // El tenant se identifica por su "slug" en la URL: /voice/:slug/...
 // ---------------------------------------------------------------------------
 
+function slugify(s) {
+  return String(s)
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/(^-|-$)/g, "");
+}
+
+async function uniqueTenantSlug(env, name) {
+  const base = slugify(name) || "negocio";
+  let candidate = base;
+  let n = 1;
+  while (true) {
+    const existing = await sb(env, `tenants?slug=eq.${encodeURIComponent(candidate)}&select=id`);
+    if (!existing.length) return candidate;
+    n += 1;
+    candidate = `${base}-${n}`;
+  }
+}
+
+// Borra en cascada todo lo que pertenece a un tenant (usado al dar de baja un cliente de verdad,
+// para que no queden datos huérfanos ocupando lugar en Supabase).
+async function deleteTenantCascade(env, tenantId) {
+  const conversations = await sb(env, `conversations?tenant_id=eq.${tenantId}&select=id`);
+  for (const conv of conversations) {
+    await sb(env, `messages?conversation_id=eq.${conv.id}`, { method: "DELETE" });
+  }
+  await sb(env, `conversations?tenant_id=eq.${tenantId}`, { method: "DELETE" });
+  await sb(env, `dashboard_sessions?tenant_id=eq.${tenantId}`, { method: "DELETE" });
+  await sb(env, `dashboard_login_tokens?tenant_id=eq.${tenantId}`, { method: "DELETE" });
+  await sb(env, `dashboard_users?tenant_id=eq.${tenantId}`, { method: "DELETE" });
+  await sb(env, `channel_accounts?tenant_id=eq.${tenantId}`, { method: "DELETE" });
+  await sb(env, `appointments?tenant_id=eq.${tenantId}`, { method: "DELETE" });
+  await sb(env, `customers?tenant_id=eq.${tenantId}`, { method: "DELETE" });
+  await sb(env, `availability_rules?tenant_id=eq.${tenantId}`, { method: "DELETE" });
+  await sb(env, `services?tenant_id=eq.${tenantId}`, { method: "DELETE" });
+  await sb(env, `staff?tenant_id=eq.${tenantId}`, { method: "DELETE" });
+  await sb(env, `tenants?id=eq.${tenantId}`, { method: "DELETE" });
+}
+
 async function getTenantBySlug(env, slug) {
   const rows = await sb(env, `tenants?slug=eq.${encodeURIComponent(slug)}&select=*`);
   return rows[0] || null;
@@ -426,7 +467,15 @@ async function handleVerifyLogin(request, env) {
   });
 }
 
-// Devuelve { tenantId, email } si la sesión es válida, o null si no lo es.
+// Devuelve true si el tenant no existe o tiene el acceso cortado (subscription_status !== "active").
+async function isTenantBlocked(env, tenantId) {
+  const rows = await sb(env, `tenants?id=eq.${tenantId}&select=subscription_status`);
+  const tenant = rows[0];
+  return !tenant || tenant.subscription_status !== "active";
+}
+
+// Devuelve { tenantId, email } si la sesión es válida y el cliente no está desactivado,
+// o null en cualquier otro caso.
 async function requireSession(request, env) {
   const auth = request.headers.get("Authorization") || "";
   const match = auth.match(/^Bearer (.+)$/);
@@ -437,6 +486,7 @@ async function requireSession(request, env) {
   const session = rows[0];
   if (!session) return null;
   if (new Date(session.expires_at) < new Date()) return null;
+  if (await isTenantBlocked(env, session.tenant_id)) return null;
   return { tenantId: session.tenant_id, email: session.email };
 }
 
@@ -694,17 +744,32 @@ export default {
         return json(rows);
       }
 
-      // POST /clients — crea un cliente nuevo
+      // POST /clients — crea un cliente nuevo: tenant (para agentes/dashboard) + agency_client (para el panel) + acceso al dashboard
       if (request.method === "POST" && url.pathname === "/clients") {
         const body = await request.json();
-        if (!body.id || !body.name || !body.plan) {
-          return json({ error: "Faltan campos obligatorios: id, name, plan" }, 400);
+        if (!body.name || !body.plan) {
+          return json({ error: "Faltan campos obligatorios: name, plan" }, 400);
         }
+
+        const slug = await uniqueTenantSlug(env, body.name);
+        const [tenant] = await sb(env, "tenants", {
+          method: "POST",
+          prefer: "return=representation",
+          body: {
+            name: body.name,
+            slug,
+            subscription_status: body.status === "active" ? "active" : "inactive",
+            address: body.address || null,
+            phone: body.phone || null,
+          },
+        });
+
+        const id = body.id || slug;
         const [row] = await sb(env, "agency_clients", {
           method: "POST",
           prefer: "return=representation",
           body: {
-            id: body.id,
+            id,
             name: body.name,
             short: body.short || body.name.slice(0, 2).toUpperCase(),
             plan: body.plan,
@@ -717,9 +782,18 @@ export default {
             rating: body.rating || null,
             modules: body.modules || {},
             notes: body.notes || null,
+            tenant_id: tenant.id,
           },
         });
-        return json(row);
+
+        if (body.dashboard_email) {
+          await sb(env, "dashboard_users", {
+            method: "POST",
+            body: { tenant_id: tenant.id, email: body.dashboard_email.trim().toLowerCase() },
+          });
+        }
+
+        return json({ ...row, tenant_id: tenant.id, tenant_slug: slug });
       }
 
       // PATCH /clients/:id — actualiza un cliente existente (edición parcial)
@@ -737,12 +811,18 @@ export default {
         return json(row);
       }
 
-      // DELETE /clients/:id — borra un cliente (uso real: solo para el ejemplo ficticio o errores de alta)
+      // DELETE /clients/:id — borra un cliente Y todo lo que pertenece a su tenant (agenda, clientas,
+      // servicios, acceso al dashboard...) para que no quede nada huérfano ocupando lugar.
       const deleteMatch = url.pathname.match(/^\/clients\/([^/]+)$/);
       if (request.method === "DELETE" && deleteMatch) {
         const id = decodeURIComponent(deleteMatch[1]);
+        const existing = await sb(env, `agency_clients?id=eq.${encodeURIComponent(id)}&select=tenant_id`);
+        const tenantId = existing[0]?.tenant_id;
+        if (tenantId) {
+          await deleteTenantCascade(env, tenantId);
+        }
         await sb(env, `agency_clients?id=eq.${encodeURIComponent(id)}`, { method: "DELETE" });
-        return json({ deleted: true, id });
+        return json({ deleted: true, id, tenant_deleted: !!tenantId });
       }
 
       if (request.method === "GET" && url.pathname === "/clients/ads-overview") {
