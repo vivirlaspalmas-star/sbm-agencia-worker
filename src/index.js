@@ -818,10 +818,12 @@ export default {
         const id = decodeURIComponent(deleteMatch[1]);
         const existing = await sb(env, `agency_clients?id=eq.${encodeURIComponent(id)}&select=tenant_id`);
         const tenantId = existing[0]?.tenant_id;
+        // Primero se borra agency_clients (referencia a tenants vía tenant_id) y luego el tenant,
+        // porque el FK agency_clients_tenant_id_fkey impide borrar el tenant mientras algo lo referencie.
+        await sb(env, `agency_clients?id=eq.${encodeURIComponent(id)}`, { method: "DELETE" });
         if (tenantId) {
           await deleteTenantCascade(env, tenantId);
         }
-        await sb(env, `agency_clients?id=eq.${encodeURIComponent(id)}`, { method: "DELETE" });
         return json({ deleted: true, id, tenant_deleted: !!tenantId });
       }
 
