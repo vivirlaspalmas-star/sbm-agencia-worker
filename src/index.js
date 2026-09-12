@@ -180,6 +180,16 @@ async function handleAdsPauseAll(request, env, clientId) {
 // El tenant se identifica por su "slug" en la URL: /voice/:slug/...
 // ---------------------------------------------------------------------------
 
+async function isTenantBlocked(env, tenantId) {
+  try {
+    const rows = await sb(env, `agency_clients?tenant_id=eq.${tenantId}&select=status`);
+    if (!rows || rows.length === 0) return false; // no ligado a la agencia (ej. tenant demo) -> nunca se bloquea
+    return rows[0].status !== "active";
+  } catch (err) {
+    return false; // si la comprobación falla técnicamente, no bloqueamos (fail-open) para no tumbar el servicio por un fallo de red
+  }
+}
+
 function slugify(s) {
   return String(s)
     .toLowerCase()
@@ -245,10 +255,20 @@ async function handleListServices(request, env, slug) {
   );
 }
 
+async function resolveServiceId(env, tenantId, serviceId) {
+  if (/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(serviceId)) return serviceId;
+  const list = (await sb(env, `services?tenant_id=eq.${tenantId}&select=id,name`)) || [];
+  const target = slugify(serviceId);
+  const exact = list.find((s) => slugify(s.name) === target);
+  if (exact) return exact.id;
+  const partial = list.find((s) => slugify(s.name).includes(target) || target.includes(slugify(s.name)));
+  return partial ? partial.id : serviceId;
+}
+
 async function handleCheckAvailability(request, env, slug) {
   const body = await request.json().catch(() => ({}));
-  const { date, service_id: serviceId } = body;
-  if (!date || !serviceId) {
+  const { date, service_id: rawServiceId } = body;
+  if (!date || !rawServiceId) {
     return json({ error: "Faltan parámetros: date, service_id" }, 400);
   }
 
@@ -256,6 +276,7 @@ async function handleCheckAvailability(request, env, slug) {
   if (!tenant) return json({ error: "Negocio no encontrado" }, 404);
   if (tenant.subscription_status !== "active") return json({ error: "Servicio no disponible" }, 403);
 
+  const serviceId = await resolveServiceId(env, tenant.id, rawServiceId);
   const serviceRows = await sb(env, `services?id=eq.${serviceId}&tenant_id=eq.${tenant.id}&select=duration_minutes`);
   const service = serviceRows[0];
   if (!service) return json({ error: "Servicio no encontrado" }, 404);
@@ -280,6 +301,8 @@ async function handleCheckAvailability(request, env, slug) {
     `appointments?tenant_id=eq.${tenant.id}&starts_at=gte.${date}T00:00:00&starts_at=lte.${date}T23:59:59&status=neq.cancelled&select=staff_id,starts_at,ends_at`
   );
 
+  const stepMinutes = 30; // huecos ofrecidos cada 30 min, no solo cada "duración del servicio"
+  const now = new Date();
   const slots = [];
   for (const rule of rules) {
     const staffInfo = activeStaffById.get(rule.staff_id);
@@ -296,7 +319,7 @@ async function handleCheckAvailability(request, env, slug) {
           new Date(a.starts_at) < slotEnd &&
           new Date(a.ends_at) > cursor
       );
-      if (!overlaps) {
+      if (!overlaps && cursor > now) {
         slots.push({
           staff_id: rule.staff_id,
           staff_name: staffInfo.name,
@@ -304,7 +327,7 @@ async function handleCheckAvailability(request, env, slug) {
           ends_at: slotEnd.toISOString(),
         });
       }
-      cursor = new Date(cursor.getTime() + durationMin * 60000);
+      cursor = new Date(cursor.getTime() + stepMinutes * 60000);
     }
   }
   slots.sort((a, b) => new Date(a.starts_at) - new Date(b.starts_at));
@@ -326,7 +349,8 @@ async function handleCreateAppointment(request, env, slug) {
   if (!tenant) return json({ error: "Negocio no encontrado" }, 404);
   if (tenant.subscription_status !== "active") return json({ error: "Servicio no disponible" }, 403);
 
-  const serviceRows = await sb(env, `services?id=eq.${service_id}&tenant_id=eq.${tenant.id}&select=duration_minutes`);
+  const resolvedServiceId = await resolveServiceId(env, tenant.id, service_id);
+  const serviceRows = await sb(env, `services?id=eq.${resolvedServiceId}&tenant_id=eq.${tenant.id}&select=duration_minutes`);
   const service = serviceRows[0];
   if (!service) return json({ error: "Servicio no encontrado" }, 404);
 
@@ -353,7 +377,7 @@ async function handleCreateAppointment(request, env, slug) {
     body: {
       tenant_id: tenant.id,
       customer_id: customerId,
-      service_id,
+      service_id: resolvedServiceId,
       staff_id,
       starts_at: startsAtDate.toISOString(),
       ends_at: endsAtDate.toISOString(),
@@ -465,13 +489,6 @@ async function handleVerifyLogin(request, env) {
     tenant_id: loginToken.tenant_id,
     tenant_name: tenantRows[0]?.name || "tu negocio",
   });
-}
-
-// Devuelve true si el tenant no existe o tiene el acceso cortado (subscription_status !== "active").
-async function isTenantBlocked(env, tenantId) {
-  const rows = await sb(env, `tenants?id=eq.${tenantId}&select=subscription_status`);
-  const tenant = rows[0];
-  return !tenant || tenant.subscription_status !== "active";
 }
 
 // Devuelve { tenantId, email } si la sesión es válida y el cliente no está desactivado,
@@ -818,8 +835,6 @@ export default {
         const id = decodeURIComponent(deleteMatch[1]);
         const existing = await sb(env, `agency_clients?id=eq.${encodeURIComponent(id)}&select=tenant_id`);
         const tenantId = existing[0]?.tenant_id;
-        // Primero se borra agency_clients (referencia a tenants vía tenant_id) y luego el tenant,
-        // porque el FK agency_clients_tenant_id_fkey impide borrar el tenant mientras algo lo referencie.
         await sb(env, `agency_clients?id=eq.${encodeURIComponent(id)}`, { method: "DELETE" });
         if (tenantId) {
           await deleteTenantCascade(env, tenantId);
