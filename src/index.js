@@ -236,23 +236,24 @@ async function getTenantBySlug(env, slug) {
   return rows[0] || null;
 }
 
+async function getServicesForTenant(env, tenantId) {
+  const services = await sb(
+    env,
+    `services?tenant_id=eq.${tenantId}&active=eq.true&select=id,name,duration_minutes,price_cents&order=name.asc`
+  );
+  return services.map((s) => ({
+    id: s.id,
+    name: s.name,
+    duration_minutes: s.duration_minutes,
+    price_eur: s.price_cents / 100,
+  }));
+}
+
 async function handleListServices(request, env, slug) {
   const tenant = await getTenantBySlug(env, slug);
   if (!tenant) return json({ error: "Negocio no encontrado" }, 404);
   if (tenant.subscription_status !== "active") return json({ error: "Servicio no disponible" }, 403);
-
-  const services = await sb(
-    env,
-    `services?tenant_id=eq.${tenant.id}&active=eq.true&select=id,name,duration_minutes,price_cents&order=name.asc`
-  );
-  return json(
-    services.map((s) => ({
-      id: s.id,
-      name: s.name,
-      duration_minutes: s.duration_minutes,
-      price_eur: s.price_cents / 100,
-    }))
-  );
+  return json(await getServicesForTenant(env, tenant.id));
 }
 
 async function resolveServiceId(env, tenantId, serviceId) {
@@ -265,40 +266,30 @@ async function resolveServiceId(env, tenantId, serviceId) {
   return partial ? partial.id : serviceId;
 }
 
-async function handleCheckAvailability(request, env, slug) {
-  const body = await request.json().catch(() => ({}));
-  const { date, service_id: rawServiceId } = body;
-  if (!date || !rawServiceId) {
-    return json({ error: "Faltan parámetros: date, service_id" }, 400);
-  }
-
-  const tenant = await getTenantBySlug(env, slug);
-  if (!tenant) return json({ error: "Negocio no encontrado" }, 404);
-  if (tenant.subscription_status !== "active") return json({ error: "Servicio no disponible" }, 403);
-
-  const serviceId = await resolveServiceId(env, tenant.id, rawServiceId);
-  const serviceRows = await sb(env, `services?id=eq.${serviceId}&tenant_id=eq.${tenant.id}&select=duration_minutes`);
+async function getAvailabilityForTenant(env, tenantId, date, rawServiceId) {
+  const serviceId = await resolveServiceId(env, tenantId, rawServiceId);
+  const serviceRows = await sb(env, `services?id=eq.${serviceId}&tenant_id=eq.${tenantId}&select=duration_minutes`);
   const service = serviceRows[0];
-  if (!service) return json({ error: "Servicio no encontrado" }, 404);
+  if (!service) return { error: "Servicio no encontrado" };
   const durationMin = service.duration_minutes;
 
   const weekday = new Date(`${date}T00:00:00Z`).getUTCDay(); // 0=domingo .. 6=sábado
   const rules = await sb(
     env,
-    `availability_rules?tenant_id=eq.${tenant.id}&weekday=eq.${weekday}&select=staff_id,start_time,end_time`
+    `availability_rules?tenant_id=eq.${tenantId}&weekday=eq.${weekday}&select=staff_id,start_time,end_time`
   );
-  if (rules.length === 0) return json({ date, service_id: serviceId, slots: [] });
+  if (rules.length === 0) return { date, service_id: serviceId, slots: [] };
 
   const staffIds = [...new Set(rules.map((r) => r.staff_id))];
   const staffRows = await sb(
     env,
-    `staff?tenant_id=eq.${tenant.id}&active=eq.true&id=in.(${staffIds.join(",")})&select=id,name`
+    `staff?tenant_id=eq.${tenantId}&active=eq.true&id=in.(${staffIds.join(",")})&select=id,name`
   );
   const activeStaffById = new Map(staffRows.map((s) => [s.id, s]));
 
   const existingAppts = await sb(
     env,
-    `appointments?tenant_id=eq.${tenant.id}&starts_at=gte.${date}T00:00:00&starts_at=lte.${date}T23:59:59&status=neq.cancelled&select=staff_id,starts_at,ends_at`
+    `appointments?tenant_id=eq.${tenantId}&starts_at=gte.${date}T00:00:00&starts_at=lte.${date}T23:59:59&status=neq.cancelled&select=staff_id,starts_at,ends_at`
   );
 
   const stepMinutes = 30; // huecos ofrecidos cada 30 min, no solo cada "duración del servicio"
@@ -332,7 +323,22 @@ async function handleCheckAvailability(request, env, slug) {
   }
   slots.sort((a, b) => new Date(a.starts_at) - new Date(b.starts_at));
 
-  return json({ date, service_id: serviceId, slots });
+  return { date, service_id: serviceId, slots };
+}
+
+async function handleCheckAvailability(request, env, slug) {
+  const body = await request.json().catch(() => ({}));
+  const { date, service_id: rawServiceId } = body;
+  if (!date || !rawServiceId) {
+    return json({ error: "Faltan parámetros: date, service_id" }, 400);
+  }
+
+  const tenant = await getTenantBySlug(env, slug);
+  if (!tenant) return json({ error: "Negocio no encontrado" }, 404);
+  if (tenant.subscription_status !== "active") return json({ error: "Servicio no disponible" }, 403);
+
+  const result = await getAvailabilityForTenant(env, tenant.id, date, rawServiceId);
+  return json(result, result.error ? 404 : 200);
 }
 
 async function handleCreateAppointment(request, env, slug) {
@@ -733,6 +739,211 @@ async function handleCreateAppointmentForTenant(env, tenantId, input, source) {
   return { confirmed: true, appointment };
 }
 
+// ---------------------------------------------------------------------------
+// Mensajería (WhatsApp + Instagram) — migrada desde el Worker del cliente piloto
+// para que un único Worker multi-tenant sirva voz, dashboard y mensajería.
+// ---------------------------------------------------------------------------
+
+const MESSAGING_MODEL = "claude-sonnet-4-6";
+
+const AGENT_TOOLS = [
+  {
+    name: "list_services",
+    description: "Lista los servicios activos que ofrece el negocio, con duración y precio.",
+    input_schema: { type: "object", properties: {} },
+  },
+  {
+    name: "check_availability",
+    description: "Devuelve los huecos libres para un servicio en una fecha concreta (formato YYYY-MM-DD).",
+    input_schema: {
+      type: "object",
+      properties: {
+        date: { type: "string", description: "Fecha en formato YYYY-MM-DD" },
+        service_id: { type: "string", description: "ID o nombre del servicio solicitado" },
+      },
+      required: ["date", "service_id"],
+    },
+  },
+  {
+    name: "create_appointment",
+    description: "Crea una cita confirmada para el cliente.",
+    input_schema: {
+      type: "object",
+      properties: {
+        customer_name: { type: "string", description: "Nombre completo del cliente." },
+        customer_phone: { type: "string", description: "Teléfono del cliente en formato internacional, ej. +34600000000." },
+        service_id: { type: "string", description: "El id o nombre del servicio, tal como lo devolvió list_services." },
+        staff_id: { type: "string", description: "El id (UUID) del profesional, tal como lo devolvió check_availability en el slot elegido." },
+        starts_at: { type: "string", description: "Fecha y hora de inicio en formato ISO 8601, tal como lo devolvió check_availability." },
+      },
+      required: ["customer_name", "service_id", "staff_id", "starts_at"],
+    },
+  },
+];
+
+async function runAgentTool(env, tenantId, name, input, channel) {
+  if (name === "list_services") {
+    return getServicesForTenant(env, tenantId);
+  }
+  if (name === "check_availability") {
+    return getAvailabilityForTenant(env, tenantId, input.date, input.service_id);
+  }
+  if (name === "create_appointment") {
+    const resolvedServiceId = await resolveServiceId(env, tenantId, input.service_id);
+    return handleCreateAppointmentForTenant(env, tenantId, { ...input, service_id: resolvedServiceId }, channel);
+  }
+  return { error: `Herramienta desconocida: ${name}` };
+}
+
+async function askAgent(env, tenantId, systemPrompt, history, channel) {
+  let messages = [...history];
+  for (let i = 0; i < 5; i++) {
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": env.ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: MESSAGING_MODEL,
+        max_tokens: 1024,
+        system: systemPrompt,
+        tools: AGENT_TOOLS,
+        messages,
+      }),
+    });
+    const rawText = await res.text();
+    if (!res.ok) throw new Error(`Anthropic ${res.status}: ${rawText}`);
+    let data;
+    try {
+      data = JSON.parse(rawText);
+    } catch (e) {
+      throw new Error(`Anthropic invalid JSON (status ${res.status}): ${rawText.slice(0, 500)}`);
+    }
+    const toolUses = (data.content || []).filter((b) => b.type === "tool_use");
+    const textBlocks = (data.content || []).filter((b) => b.type === "text");
+    if (toolUses.length === 0) {
+      return textBlocks.map((b) => b.text).join("\n").trim();
+    }
+    messages.push({ role: "assistant", content: data.content });
+    const toolResults = [];
+    for (const t of toolUses) {
+      const result = await runAgentTool(env, tenantId, t.name, t.input, channel);
+      toolResults.push({ type: "tool_result", tool_use_id: t.id, content: JSON.stringify(result) });
+    }
+    messages.push({ role: "user", content: toolResults });
+  }
+  return "Disculpa, estoy teniendo problemas para procesar tu solicitud. En breve te contactamos.";
+}
+
+async function getOrCreateConversation(env, tenantId, channel, externalUserId) {
+  const existing = await sb(
+    env,
+    `conversations?tenant_id=eq.${tenantId}&channel=eq.${channel}&external_user_id=eq.${encodeURIComponent(externalUserId)}`
+  );
+  if (existing.length) return existing[0];
+  const created = await sb(env, "conversations", {
+    method: "POST",
+    prefer: "return=representation",
+    body: { tenant_id: tenantId, channel, external_user_id: externalUserId },
+  });
+  return created[0];
+}
+
+async function saveMessage(env, conversationId, role, content) {
+  await sb(env, "messages", { method: "POST", body: { conversation_id: conversationId, role, content } });
+}
+
+async function getMessageHistory(env, conversationId) {
+  const rows = await sb(
+    env,
+    `messages?conversation_id=eq.${conversationId}&order=created_at.desc&select=role,content&limit=20`
+  );
+  return rows.reverse().map((r) => ({ role: r.role === "agent" ? "assistant" : "user", content: r.content }));
+}
+
+async function findTenantByChannel(env, channel, externalId) {
+  const rows = await sb(
+    env,
+    `channel_accounts?channel=eq.${channel}&external_id=eq.${encodeURIComponent(externalId)}&select=tenant_id`
+  );
+  return rows[0]?.tenant_id || null;
+}
+
+async function getTenantInfo(env, tenantId) {
+  const rows = await sb(env, `tenants?id=eq.${tenantId}&select=name,address,phone`);
+  return rows[0] || { name: "el negocio", address: null, phone: null };
+}
+
+async function sendWhatsApp(env, phoneNumberId, to, text) {
+  const res = await fetch(`https://graph.facebook.com/v20.0/${phoneNumberId}/messages`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${env.META_WHATSAPP_TOKEN}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ messaging_product: "whatsapp", to, text: { body: text } }),
+  });
+  if (!res.ok) throw new Error(`WhatsApp send ${res.status}: ${await res.text()}`);
+}
+
+async function sendInstagram(env, igBusinessId, recipientId, text) {
+  const res = await fetch(`https://graph.facebook.com/v20.0/${igBusinessId}/messages`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${env.META_INSTAGRAM_TOKEN}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ recipient: { id: recipientId }, message: { text } }),
+  });
+  if (!res.ok) throw new Error(`Instagram send ${res.status}: ${await res.text()}`);
+}
+
+function buildMessagingSystemPrompt(tenant, nowCanary) {
+  const addressLine = tenant.address
+    ? `- Dirección: ${tenant.address}\n- Mapa: https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(tenant.address)}`
+    : "- Dirección: no configurada todavía; si te preguntan, di que confirmarás y no la inventes.";
+  const phoneLine = tenant.phone ? `- Teléfono/WhatsApp: ${tenant.phone}` : "- Teléfono: no configurado todavía.";
+  return `Eres el agente de reservas de "${tenant.name}", un centro de belleza/bienestar.
+Hoy es ${nowCanary} (hora de Canarias). Usa siempre esta fecha y hora como referencia real para "hoy", "mañana", "esta semana", etc. — nunca asumas ni inventes otro año o fecha.
+Responde siempre en el mismo idioma en el que te escribe la clienta (detectalo tú mismo por su mensaje: español, inglés, alemán, portugués, etc).
+Mantén un tono cercano y profesional, en frases cortas (esto es un chat de WhatsApp/Instagram).
+Datos del negocio (úsalos si te preguntan por dirección, teléfono o ubicación, nunca los inventes si no coinciden):
+${addressLine}
+${phoneLine}
+Tu objetivo es ayudar a la clienta a reservar una cita: entender qué servicio quiere, comprobar disponibilidad real con la herramienta check_availability, y confirmar la cita con create_appointment solo cuando la clienta haya dicho que sí.
+Nunca inventes horarios ni servicios: usa siempre las herramientas para consultarlos. Los nombres de servicios están guardados en español en la base de datos; si respondes en otro idioma, tradúcelos de forma natural en tu texto.
+Si no tienes el teléfono de la clienta en la conversación, pídelo antes de confirmar la cita.`;
+}
+
+async function handleIncomingMessage(env, { channel, channelExternalId, externalUserId, text }) {
+  const tenantId = await findTenantByChannel(env, channel, channelExternalId);
+  if (!tenantId) {
+    console.log(`No hay tenant configurado para ${channel}:${channelExternalId}`);
+    return;
+  }
+  if (await isTenantBlocked(env, tenantId)) {
+    console.log(`Tenant ${tenantId} desactivado, se ignora el mensaje entrante de ${channel}`);
+    return;
+  }
+  const conversation = await getOrCreateConversation(env, tenantId, channel, externalUserId);
+  await saveMessage(env, conversation.id, "user", text);
+  const history = await getMessageHistory(env, conversation.id);
+  const tenant = await getTenantInfo(env, tenantId);
+  const nowCanary = new Date().toLocaleString("es-ES", {
+    timeZone: "Atlantic/Canary",
+    weekday: "long",
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+  const systemPrompt = buildMessagingSystemPrompt(tenant, nowCanary);
+  const reply = await askAgent(env, tenantId, systemPrompt, [...history, { role: "user", content: text }], channel);
+  await saveMessage(env, conversation.id, "agent", reply);
+  if (channel === "whatsapp") {
+    await sendWhatsApp(env, channelExternalId, externalUserId, reply);
+  } else {
+    await sendInstagram(env, channelExternalId, externalUserId, reply);
+  }
+}
+
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, PATCH, DELETE, OPTIONS",
@@ -901,6 +1112,77 @@ export default {
         const session = await requireSession(request, env);
         if (!session) return json({ error: "Sesión no válida o caducada. Vuelve a iniciar sesión." }, 401);
         return DASHBOARD_ROUTES[routeKey](request, env, session.tenantId);
+      }
+
+      // --- Webhook de Meta (WhatsApp + Instagram), verificación ---
+      if (request.method === "GET" && url.pathname === "/webhook") {
+        const mode = url.searchParams.get("hub.mode");
+        const token = url.searchParams.get("hub.verify_token");
+        const challenge = url.searchParams.get("hub.challenge");
+        if (mode === "subscribe" && token === env.META_VERIFY_TOKEN) {
+          return new Response(challenge, { status: 200 });
+        }
+        return new Response("Token de verificación incorrecto", { status: 403 });
+      }
+
+      // --- Webhook de Meta (WhatsApp + Instagram), mensajes entrantes ---
+      if (request.method === "POST" && url.pathname === "/webhook") {
+        const body = await request.json().catch(() => ({}));
+        try {
+          if (body.object === "whatsapp_business_account") {
+            for (const entry of body.entry || []) {
+              for (const change of entry.changes || []) {
+                const value = change.value;
+                const phoneNumberId = value?.metadata?.phone_number_id;
+                for (const msg of value?.messages || []) {
+                  if (msg.type === "text" && phoneNumberId) {
+                    try {
+                      await handleIncomingMessage(env, {
+                        channel: "whatsapp",
+                        channelExternalId: phoneNumberId,
+                        externalUserId: msg.from,
+                        text: msg.text.body,
+                      });
+                    } catch (innerErr) {
+                      console.error("handleIncomingMessage error (whatsapp):", innerErr, innerErr && innerErr.message);
+                      try {
+                        await sendWhatsApp(env, phoneNumberId, msg.from, "Disculpa, he tenido un problema técnico procesando tu mensaje. Por favor, intenta de nuevo en unos minutos.");
+                      } catch (sendErr) {
+                        console.error("Fallback send error (whatsapp):", sendErr, sendErr && sendErr.message);
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          } else if (body.object === "instagram") {
+            for (const entry of body.entry || []) {
+              const igBusinessId = entry.id;
+              for (const event of entry.messaging || []) {
+                if (event.message?.text) {
+                  try {
+                    await handleIncomingMessage(env, {
+                      channel: "instagram",
+                      channelExternalId: igBusinessId,
+                      externalUserId: event.sender.id,
+                      text: event.message.text,
+                    });
+                  } catch (innerErr) {
+                    console.error("handleIncomingMessage error (instagram):", innerErr, innerErr && innerErr.message);
+                    try {
+                      await sendInstagram(env, igBusinessId, event.sender.id, "Disculpa, he tenido un problema técnico procesando tu mensaje. Por favor, intenta de nuevo en unos minutos.");
+                    } catch (sendErr) {
+                      console.error("Fallback send error (instagram):", sendErr, sendErr && sendErr.message);
+                    }
+                  }
+                }
+              }
+            }
+          }
+        } catch (err) {
+          console.error(err, err && err.message);
+        }
+        return new Response("EVENT_RECEIVED", { status: 200 });
       }
 
       return json({ error: "Ruta no encontrada" }, 404);
