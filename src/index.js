@@ -401,7 +401,7 @@ async function handleCreateAppointment(request, env, slug) {
 // nunca de un id en la URL, para que un cliente nunca pueda ver datos de otro.
 // ---------------------------------------------------------------------------
 
-const DASHBOARD_URL = "https://cuerpo-y-mente-dashboard.pages.dev"; // TODO: mover a un dominio propio del panel cuando se consolide
+const DASHBOARD_URL = "https://clientes.sbmaiagency.com"; // TODO: mover a un dominio propio del panel cuando se consolide
 const LOGIN_TOKEN_TTL_MS = 15 * 60 * 1000; // 15 minutos para canjear el enlace
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 días de sesión
 
