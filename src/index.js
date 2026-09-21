@@ -966,6 +966,13 @@ export default {
     }
 
     try {
+      if (url.pathname === "/clients" || url.pathname.startsWith("/clients/")) {
+        const auth = request.headers.get("Authorization") || "";
+        if (auth !== `Bearer ${env.AGENCY_PANEL_KEY}`) {
+          return new Response(JSON.stringify({ error: "No autorizado" }), { status: 401 });
+        }
+      }
+
       // GET /clients — lista todos los clientes de la agencia
       if (request.method === "GET" && url.pathname === "/clients") {
         const rows = await sb(env, "agency_clients?select=*&order=created_at.asc");
