@@ -606,8 +606,16 @@ async function handleDashboardServices(request, env, tenantId) {
 }
 
 async function handleDashboardAvailability(request, env, tenantId) {
-  const rows = await sb(env, `availability_rules?tenant_id=eq.${tenantId}&select=id,weekday,start_time,end_time,staff_id&order=weekday.asc,start_time.asc`);
+  // Si el panel indica un profesional (?staff_id=...), devolvemos solo su horario; si no, todas las reglas del negocio.
+  const staffId = new URL(request.url).searchParams.get("staff_id");
+  const staffFilter = staffId ? `&staff_id=eq.${encodeURIComponent(staffId)}` : "";
+  const rows = await sb(env, `availability_rules?tenant_id=eq.${tenantId}${staffFilter}&select=id,weekday,start_time,end_time,staff_id&order=weekday.asc,start_time.asc`);
   return json(rows);
+}
+
+async function handleDashboardStaff(request, env, tenantId) {
+  const rows = await sb(env, `staff?tenant_id=eq.${tenantId}&select=id,name,active&order=created_at.asc`);
+  return json(rows || []);
 }
 
 async function handleDashboardAppointmentCreate(request, env, tenantId) {
@@ -667,10 +675,16 @@ async function handleDashboardServiceUpdate(request, env, tenantId) {
 
 async function handleDashboardAvailabilitySave(request, env, tenantId) {
   const body = await request.json();
-  const staffRows = await sb(env, `staff?tenant_id=eq.${tenantId}&select=id&limit=1`);
-  const staffId = staffRows[0]?.id;
-  if (!staffId) return json({ error: "No hay ningún miembro del personal dado de alta para este negocio" }, 400);
-  await sb(env, `availability_rules?tenant_id=eq.${tenantId}`, { method: "DELETE" });
+  const staffRows = (await sb(env, `staff?tenant_id=eq.${tenantId}&select=id`)) || [];
+  if (!staffRows.length) return json({ error: "No hay ningún miembro del personal dado de alta para este negocio" }, 400);
+  // El horario se guarda por profesional: solo se sustituyen las reglas de ESE staff_id; las de los demás no se tocan.
+  let staffId = body.staff_id;
+  if (!staffId) {
+    if (staffRows.length === 1) staffId = staffRows[0].id;
+    else return json({ error: "Falta staff_id: indica de qué profesional es este horario" }, 400);
+  }
+  if (!staffRows.some((s) => s.id === staffId)) return json({ error: "Ese profesional no pertenece a este negocio" }, 400);
+  await sb(env, `availability_rules?tenant_id=eq.${tenantId}&staff_id=eq.${encodeURIComponent(staffId)}`, { method: "DELETE" });
   const newRows = (body.rules || []).map((r) => ({
     tenant_id: tenantId,
     staff_id: staffId,
@@ -681,7 +695,7 @@ async function handleDashboardAvailabilitySave(request, env, tenantId) {
   const inserted = newRows.length
     ? await sb(env, "availability_rules", { method: "POST", prefer: "return=representation", body: newRows })
     : [];
-  return json({ saved: true, rules: inserted });
+  return json({ saved: true, staff_id: staffId, rules: inserted });
 }
 
 async function handleDashboardCustomerArchive(request, env, tenantId) {
@@ -1107,6 +1121,7 @@ export default {
         "GET /dashboard/customers": handleDashboardCustomers,
         "GET /dashboard/services": handleDashboardServices,
         "GET /dashboard/availability": handleDashboardAvailability,
+        "GET /dashboard/staff": handleDashboardStaff,
         "POST /dashboard/appointments/create": handleDashboardAppointmentCreate,
         "POST /dashboard/appointments/cancel": handleDashboardAppointmentCancel,
         "POST /dashboard/services/create": handleDashboardServiceCreate,
