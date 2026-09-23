@@ -266,6 +266,42 @@ async function resolveServiceId(env, tenantId, serviceId) {
   return partial ? partial.id : serviceId;
 }
 
+// Zona horaria del negocio (copiado tal cual de sbm-mensajeria-worker para que ambos Workers conviertan igual).
+// Los horarios de availability_rules y las horas que se dicen a la clienta son hora de Canarias;
+// en la base de datos (timestamptz) siempre se guarda el instante real en UTC. Canarias cambia de UTC+0 a UTC+1 en verano.
+var BUSINESS_TZ = "Atlantic/Canary";
+function tzOffsetMinutes(date) {
+const parts = new Intl.DateTimeFormat("en-US", { timeZone: BUSINESS_TZ, hourCycle: "h23", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit" }).formatToParts(date);
+const g = (t) => Number(parts.find((p) => p.type === t).value);
+const asUTC = Date.UTC(g("year"), g("month") - 1, g("day"), g("hour"), g("minute"), g("second"));
+return Math.round((asUTC - date.getTime()) / 6e4);
+}
+function canaryToUtc(dateStr, timeStr) {
+const [y, m, d] = String(dateStr).split("-").map(Number);
+const [hh, mm, ss] = String(timeStr || "00:00:00").split(":").map(Number);
+const guess = Date.UTC(y, m - 1, d, hh || 0, mm || 0, ss || 0);
+const off1 = tzOffsetMinutes(new Date(guess));
+let ts = guess - off1 * 6e4;
+const off2 = tzOffsetMinutes(new Date(ts));
+if (off2 !== off1) ts = guess - off2 * 6e4;
+return new Date(ts);
+}
+function toCanaryIso(date) {
+const off = tzOffsetMinutes(date);
+const local = new Date(date.getTime() + off * 6e4).toISOString().slice(0, 19);
+const sign = off >= 0 ? "+" : "-";
+const abs = Math.abs(off);
+return local + sign + String(Math.floor(abs / 60)).padStart(2, "0") + ":" + String(abs % 60).padStart(2, "0");
+}
+function formatCanary(date) {
+return new Intl.DateTimeFormat("es-ES", { timeZone: BUSINESS_TZ, weekday: "long", day: "numeric", month: "long", hour: "2-digit", minute: "2-digit" }).format(date);
+}
+function parseStartsAt(value) {
+const s = String(value || "").trim();
+if (/(Z|[+-]\d{2}:?\d{2})$/i.test(s)) return new Date(s);
+const [datePart, timePart] = s.split(/[T ]/);
+return canaryToUtc(datePart, timePart || "00:00:00");
+}
 async function getAvailabilityForTenant(env, tenantId, date, rawServiceId) {
   const serviceId = await resolveServiceId(env, tenantId, rawServiceId);
   const serviceRows = await sb(env, `services?id=eq.${serviceId}&tenant_id=eq.${tenantId}&select=duration_minutes`);
@@ -289,7 +325,7 @@ async function getAvailabilityForTenant(env, tenantId, date, rawServiceId) {
 
   const existingAppts = await sb(
     env,
-    `appointments?tenant_id=eq.${tenantId}&starts_at=gte.${date}T00:00:00&starts_at=lte.${date}T23:59:59&status=neq.cancelled&select=staff_id,starts_at,ends_at`
+    `appointments?tenant_id=eq.${tenantId}&starts_at=gte.${canaryToUtc(date, "00:00:00").toISOString()}&starts_at=lte.${canaryToUtc(date, "23:59:59").toISOString()}&status=neq.cancelled&select=staff_id,starts_at,ends_at`
   );
 
   const stepMinutes = 30; // huecos ofrecidos cada 30 min, no solo cada "duración del servicio"
@@ -299,8 +335,8 @@ async function getAvailabilityForTenant(env, tenantId, date, rawServiceId) {
     const staffInfo = activeStaffById.get(rule.staff_id);
     if (!staffInfo) continue;
 
-    let cursor = new Date(`${date}T${rule.start_time}Z`);
-    const end = new Date(`${date}T${rule.end_time}Z`);
+    let cursor = canaryToUtc(date, rule.start_time);
+    const end = canaryToUtc(date, rule.end_time);
 
     while (cursor.getTime() + durationMin * 60000 <= end.getTime()) {
       const slotEnd = new Date(cursor.getTime() + durationMin * 60000);
@@ -314,8 +350,9 @@ async function getAvailabilityForTenant(env, tenantId, date, rawServiceId) {
         slots.push({
           staff_id: rule.staff_id,
           staff_name: staffInfo.name,
-          starts_at: cursor.toISOString(),
-          ends_at: slotEnd.toISOString(),
+          starts_at: toCanaryIso(cursor),
+hora_local: formatCanary(cursor),
+          ends_at: toCanaryIso(slotEnd),
         });
       }
       cursor = new Date(cursor.getTime() + stepMinutes * 60000);
@@ -360,7 +397,7 @@ async function handleCreateAppointment(request, env, slug) {
   const service = serviceRows[0];
   if (!service) return json({ error: "Servicio no encontrado" }, 404);
 
-  const startsAtDate = new Date(starts_at);
+  const startsAtDate = parseStartsAt(starts_at);
   const endsAtDate = new Date(startsAtDate.getTime() + service.duration_minutes * 60000);
 
   const existingCustomers = await sb(
@@ -718,7 +755,7 @@ async function handleCreateAppointmentForTenant(env, tenantId, input, source) {
   const serviceRows = await sb(env, `services?id=eq.${service_id}&tenant_id=eq.${tenantId}&select=duration_minutes`);
   const service = serviceRows[0];
   if (!service) return { error: "Servicio no encontrado" };
-  const startsAtDate = new Date(starts_at);
+  const startsAtDate = parseStartsAt(starts_at);
   const endsAtDate = new Date(startsAtDate.getTime() + service.duration_minutes * 60000);
 
   let customer = customer_phone
@@ -788,7 +825,7 @@ const AGENT_TOOLS = [
         customer_phone: { type: "string", description: "Teléfono del cliente en formato internacional, ej. +34600000000." },
         service_id: { type: "string", description: "El id o nombre del servicio, tal como lo devolvió list_services." },
         staff_id: { type: "string", description: "El id (UUID) del profesional, tal como lo devolvió check_availability en el slot elegido." },
-        starts_at: { type: "string", description: "Fecha y hora de inicio en formato ISO 8601, tal como lo devolvió check_availability." },
+        starts_at: { type: "string", description: "Fecha y hora de inicio en hora de Canarias, formato ISO 8601 con desfase (ej. 2026-09-10T10:00:00+01:00), copiada exactamente del campo starts_at del hueco elegido en check_availability." },
       },
       required: ["customer_name", "service_id", "staff_id", "starts_at"],
     },
