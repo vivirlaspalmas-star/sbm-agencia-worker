@@ -5,3 +5,6 @@ compatibility_date = "2026-07-01"
 [vars]
 SUPABASE_URL = "https://jbojoeifhrdjyqvfbapd.supabase.co"
 
+# Mantiene activo Supabase (plan gratuito): consulta mínima cada 2 días a las 04:00 UTC
+[triggers]
+crons = ["0 4 */2 * *"]
