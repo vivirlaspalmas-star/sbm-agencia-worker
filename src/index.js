@@ -1009,6 +1009,16 @@ function json(data, status = 200) {
 }
 
 export default {
+  // Cron: mantiene activo el proyecto de Supabase (plan gratuito pausa por inactividad)
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(
+      sb(env, "tenants?select=id&limit=1").then(
+        () => console.log("keepalive Supabase OK"),
+        (e) => console.error("keepalive Supabase FALLO", e.message)
+      )
+    );
+  },
+
   async fetch(request, env) {
     const url = new URL(request.url);
 
