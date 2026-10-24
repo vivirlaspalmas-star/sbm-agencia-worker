@@ -440,7 +440,7 @@ async function handleCreateAppointment(request, env, slug) {
 
 const DASHBOARD_URL = "https://clientes.sbmaiagency.com"; // TODO: mover a un dominio propio del panel cuando se consolide
 const LOGIN_TOKEN_TTL_MS = 15 * 60 * 1000; // 15 minutos para canjear el enlace
-const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 días de sesión
+const SESSION_TTL_MS = 180 * 24 * 60 * 60 * 1000; // 180 días de sesión
 
 function randomToken() {
   const bytes = new Uint8Array(32);
@@ -629,6 +629,12 @@ async function handleDashboardConversation(request, env, tenantId) {
   });
 }
 
+// Clientes registrados por el asistente (leads), solo del negocio de la sesión.
+async function handleDashboardContacts(request, env, tenantId) {
+  const rows = await sb(env, `leads?tenant_id=eq.${tenantId}&select=id,conversation_id,nombre,phone,nivel,zona,tipo_vivienda,presupuesto,forma_pago,plazo,idioma,resumen,updated_at&order=updated_at.desc&limit=200`);
+  return json(rows);
+}
+
 async function handleDashboardAppointments(request, env, tenantId) {
   const rows = await sb(
     env,
@@ -646,7 +652,7 @@ async function handleDashboardCustomers(request, env, tenantId) {
 }
 
 async function handleDashboardTenantInfo(request, env, tenantId) {
-  const rows = await sb(env, `tenants?id=eq.${tenantId}&select=name,address,phone,logo_url`);
+  const rows = await sb(env, `tenants?id=eq.${tenantId}&select=name,address,phone,logo_url,email,website,owner_phone,theme,vertical`);
   const tenant = rows[0];
   if (!tenant) return json({ error: "Negocio no encontrado" }, 404);
   return json(tenant);
@@ -1222,6 +1228,7 @@ export default {
         "POST /dashboard/tenant-logo": handleDashboardLogoUpload,
         "GET /dashboard/leads": handleDashboardLeads,
         "GET /dashboard/conversations": handleDashboardConversations,
+        "GET /dashboard/contacts": handleDashboardContacts,
         "GET /dashboard/conversation": handleDashboardConversation,
         "GET /dashboard/appointments": handleDashboardAppointments,
         "GET /dashboard/customers": handleDashboardCustomers,
