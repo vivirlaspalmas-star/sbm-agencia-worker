@@ -580,7 +580,7 @@ async function handleDashboardConversations(request, env, tenantId) {
   if (!convs.length) return json([]);
   const ids = convs.map((c) => c.id).join(",");
   const [msgs, leads] = await Promise.all([
-    sb(env, `messages?conversation_id=in.(${ids})&role=in.(user,assistant)&select=conversation_id,role,content,created_at&order=created_at.desc&limit=600`),
+    sb(env, `messages?conversation_id=in.(${ids})&role=in.(user,agent)&select=conversation_id,role,content,created_at&order=created_at.desc&limit=600`),
     sb(env, `leads?tenant_id=eq.${tenantId}&conversation_id=in.(${ids})&select=conversation_id,nombre,nivel`),
   ]);
   const custIds = convs.map((c) => c.customer_id).filter(Boolean).join(",");
@@ -617,7 +617,7 @@ async function handleDashboardConversation(request, env, tenantId) {
   const conv = rows[0];
   if (!conv) return json({ error: "Conversación no encontrada" }, 404);
   const [messages, leads] = await Promise.all([
-    sb(env, `messages?conversation_id=eq.${id}&role=in.(user,assistant)&select=role,content,created_at&order=created_at.asc&limit=500`),
+    sb(env, `messages?conversation_id=eq.${id}&role=in.(user,agent)&select=role,content,created_at&order=created_at.asc&limit=500`),
     sb(env, `leads?tenant_id=eq.${tenantId}&conversation_id=eq.${id}&select=nivel,nombre,zona,tipo_vivienda,presupuesto,forma_pago,plazo,idioma,promociones_enviadas,resumen`),
   ]);
   return json({
