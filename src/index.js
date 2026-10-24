@@ -572,6 +572,63 @@ async function handleDashboardLeads(request, env, tenantId) {
   return json(leads);
 }
 
+// Visor de conversaciones: solo devuelve datos del negocio de la sesión (tenantId).
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+async function handleDashboardConversations(request, env, tenantId) {
+  const convs = await sb(env, `conversations?tenant_id=eq.${tenantId}&select=id,channel,external_user_id,customer_id,last_message_at,created_at&order=last_message_at.desc.nullslast&limit=60`);
+  if (!convs.length) return json([]);
+  const ids = convs.map((c) => c.id).join(",");
+  const [msgs, leads] = await Promise.all([
+    sb(env, `messages?conversation_id=in.(${ids})&role=in.(user,assistant)&select=conversation_id,role,content,created_at&order=created_at.desc&limit=600`),
+    sb(env, `leads?tenant_id=eq.${tenantId}&conversation_id=in.(${ids})&select=conversation_id,nombre,nivel`),
+  ]);
+  const custIds = convs.map((c) => c.customer_id).filter(Boolean).join(",");
+  const customers = custIds ? await sb(env, `customers?tenant_id=eq.${tenantId}&id=in.(${custIds})&select=id,name`) : [];
+  const custName = new Map(customers.map((c) => [c.id, c.name]));
+  const leadBy = new Map(leads.map((l) => [l.conversation_id, l]));
+  const lastBy = new Map();
+  const countBy = new Map();
+  for (const m of msgs) {
+    countBy.set(m.conversation_id, (countBy.get(m.conversation_id) || 0) + 1);
+    if (!lastBy.has(m.conversation_id)) lastBy.set(m.conversation_id, m);
+  }
+  return json(convs.map((c) => {
+    const lead = leadBy.get(c.id);
+    const last = lastBy.get(c.id);
+    const isWa = c.channel === "whatsapp";
+    return {
+      id: c.id,
+      channel: c.channel,
+      name: (lead && lead.nombre) || custName.get(c.customer_id) || (isWa ? c.external_user_id : "Cliente de Instagram"),
+      contact: isWa ? c.external_user_id : null,
+      nivel: lead ? lead.nivel : null,
+      last_at: (last && last.created_at) || c.last_message_at || c.created_at,
+      preview: last ? String(last.content || "").slice(0, 110) : "",
+      count: countBy.get(c.id) || 0,
+    };
+  }));
+}
+
+async function handleDashboardConversation(request, env, tenantId) {
+  const id = new URL(request.url).searchParams.get("id") || "";
+  if (!UUID_RE.test(id)) return json({ error: "Conversación no válida" }, 400);
+  const rows = await sb(env, `conversations?id=eq.${id}&tenant_id=eq.${tenantId}&select=id,channel,external_user_id,customer_id,created_at`);
+  const conv = rows[0];
+  if (!conv) return json({ error: "Conversación no encontrada" }, 404);
+  const [messages, leads] = await Promise.all([
+    sb(env, `messages?conversation_id=eq.${id}&role=in.(user,assistant)&select=role,content,created_at&order=created_at.asc&limit=500`),
+    sb(env, `leads?tenant_id=eq.${tenantId}&conversation_id=eq.${id}&select=nivel,nombre,zona,tipo_vivienda,presupuesto,forma_pago,plazo,idioma,promociones_enviadas,resumen`),
+  ]);
+  return json({
+    id: conv.id,
+    channel: conv.channel,
+    contact: conv.channel === "whatsapp" ? conv.external_user_id : null,
+    lead: leads[0] || null,
+    messages,
+  });
+}
+
 async function handleDashboardAppointments(request, env, tenantId) {
   const rows = await sb(
     env,
@@ -1164,6 +1221,8 @@ export default {
         "GET /dashboard/tenant-info": handleDashboardTenantInfo,
         "POST /dashboard/tenant-logo": handleDashboardLogoUpload,
         "GET /dashboard/leads": handleDashboardLeads,
+        "GET /dashboard/conversations": handleDashboardConversations,
+        "GET /dashboard/conversation": handleDashboardConversation,
         "GET /dashboard/appointments": handleDashboardAppointments,
         "GET /dashboard/customers": handleDashboardCustomers,
         "GET /dashboard/services": handleDashboardServices,
