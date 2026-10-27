@@ -557,18 +557,37 @@ async function requireSession(request, env) {
 
 async function handleDashboardLeads(request, env, tenantId) {
   const normalize = (s) => (s || "").replace(/\D/g, "").slice(-9);
-  const conversations = await sb(env, `conversations?tenant_id=eq.${tenantId}&select=id,channel,external_user_id,created_at&order=created_at.desc&limit=50`);
+  const conversations = await sb(env, `conversations?tenant_id=eq.${tenantId}&select=id,channel,external_user_id,created_at&order=created_at.desc&limit=100`);
   const customers = await sb(env, `customers?tenant_id=eq.${tenantId}&select=phone`);
   const knownPhones = new Set(customers.map((c) => normalize(c.phone)).filter(Boolean));
-  const leadConvos = conversations.filter((c) => c.channel === "whatsapp" && !knownPhones.has(normalize(c.external_user_id)));
-  const leads = [];
-  for (const convo of leadConvos.slice(0, 15)) {
-    const lastMsg = await sb(env, `messages?conversation_id=eq.${convo.id}&role=eq.user&order=created_at.desc&limit=1&select=content,created_at`);
-    const preview = lastMsg[0]?.content?.slice(0, 80) || "(sin mensaje registrado)";
-    const when = lastMsg[0]?.created_at || convo.created_at;
+  const leadConvos = conversations
+    .filter((c) => (c.channel === "whatsapp" ? !knownPhones.has(normalize(c.external_user_id)) : c.channel === "instagram"))
+    .slice(0, 50);
+  if (!leadConvos.length) return json([]);
+  const ids = leadConvos.map((c) => c.id).join(",");
+  const [leadRows, userMsgs] = await Promise.all([
+    sb(env, `leads?tenant_id=eq.${tenantId}&conversation_id=in.(${ids})&select=conversation_id,nombre,nivel`),
+    sb(env, `messages?conversation_id=in.(${ids})&role=eq.user&order=created_at.desc&limit=500&select=conversation_id,content,created_at`),
+  ]);
+  const leadBy = new Map(leadRows.map((l) => [l.conversation_id, l]));
+  const lastBy = new Map();
+  for (const m of userMsgs) if (!lastBy.has(m.conversation_id)) lastBy.set(m.conversation_id, m);
+  const leads = leadConvos.map((convo) => {
+    const lead = leadBy.get(convo.id);
+    const last = lastBy.get(convo.id);
+    const isWa = convo.channel === "whatsapp";
+    const when = (last && last.created_at) || convo.created_at;
     const days = Math.max(0, Math.floor((Date.now() - new Date(when).getTime()) / 86400000));
-    leads.push({ name: "Cliente por WhatsApp", phone: convo.external_user_id, msg: preview, days, urgent: days >= 3 });
-  }
+    return {
+      name: (lead && lead.nombre) || (isWa ? "Cliente por WhatsApp" : "Cliente de Instagram"),
+      phone: isWa ? convo.external_user_id : null,
+      channel: convo.channel,
+      nivel: lead ? lead.nivel : null,
+      msg: (last && last.content ? String(last.content).slice(0, 80) : "(sin mensaje registrado)"),
+      days,
+      urgent: days >= 3,
+    };
+  });
   return json(leads);
 }
 
@@ -644,8 +663,12 @@ async function handleDashboardConversationDelete(request, env, tenantId) {
 
 // Clientes registrados por el asistente (leads), solo del negocio de la sesión.
 async function handleDashboardContacts(request, env, tenantId) {
-  const rows = await sb(env, `leads?tenant_id=eq.${tenantId}&select=id,conversation_id,nombre,phone,nivel,zona,tipo_vivienda,presupuesto,forma_pago,plazo,idioma,resumen,updated_at&order=updated_at.desc&limit=200`);
-  return json(rows);
+  const rows = await sb(env, `leads?tenant_id=eq.${tenantId}&select=id,conversation_id,nombre,phone,nivel,zona,tipo_vivienda,presupuesto,forma_pago,plazo,idioma,resumen,updated_at,conversations(channel,external_user_id)&order=updated_at.desc&limit=200`);
+  return json(rows.map((r) => {
+    const conv = r.conversations || {};
+    const { conversations, ...rest } = r;
+    return { ...rest, channel: conv.channel || null, phone: r.phone || (conv.channel === "whatsapp" ? conv.external_user_id : null) };
+  }));
 }
 
 async function handleDashboardAppointments(request, env, tenantId) {
