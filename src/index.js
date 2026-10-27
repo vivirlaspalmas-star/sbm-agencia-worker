@@ -629,6 +629,19 @@ async function handleDashboardConversation(request, env, tenantId) {
   });
 }
 
+// Elimina un cliente/conversación del negocio de la sesión. Los mensajes y el lead
+// se borran en cascada (FK ON DELETE CASCADE). Si el cliente vuelve a escribir,
+// empieza una conversación nueva.
+async function handleDashboardConversationDelete(request, env, tenantId) {
+  const body = await request.json().catch(() => ({}));
+  const id = body.conversation_id || body.id || "";
+  if (!UUID_RE.test(id)) return json({ error: "Conversación no válida" }, 400);
+  const rows = await sb(env, `conversations?id=eq.${id}&tenant_id=eq.${tenantId}&select=id`);
+  if (!rows.length) return json({ error: "Conversación no encontrada para este negocio" }, 404);
+  await sb(env, `conversations?id=eq.${id}&tenant_id=eq.${tenantId}`, { method: "DELETE" });
+  return json({ deleted: true, id });
+}
+
 // Clientes registrados por el asistente (leads), solo del negocio de la sesión.
 async function handleDashboardContacts(request, env, tenantId) {
   const rows = await sb(env, `leads?tenant_id=eq.${tenantId}&select=id,conversation_id,nombre,phone,nivel,zona,tipo_vivienda,presupuesto,forma_pago,plazo,idioma,resumen,updated_at&order=updated_at.desc&limit=200`);
@@ -1241,6 +1254,7 @@ export default {
         "POST /dashboard/services/update": handleDashboardServiceUpdate,
         "POST /dashboard/availability/save": handleDashboardAvailabilitySave,
         "POST /dashboard/customers/archive": handleDashboardCustomerArchive,
+        "POST /dashboard/conversations/delete": handleDashboardConversationDelete,
       };
       const routeKey = `${request.method} ${url.pathname}`;
       if (DASHBOARD_ROUTES[routeKey]) {
